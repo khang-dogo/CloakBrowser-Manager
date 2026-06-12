@@ -1,9 +1,3 @@
-"""CloakBrowser Manager — FastAPI application.
-
-Serves the React dashboard (static files) and provides a REST API
-for browser profile management with live VNC viewing.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -38,6 +32,41 @@ from .models import (
     TagResponse,
 )
 
+async def _reap_zombies_periodically():
+    """Background watchdog: reap zombie child processes every 60 seconds.
+
+    Chrome processes spawned via Playwright may become zombies when they
+    crash or get killed before the parent calls waitpid(). This task
+    periodically reaps them so the process table doesn't fill up over time.
+    """
+    while True:
+        try:
+            while True:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+        except ChildProcessError:
+            pass
+        await asyncio.sleep(60)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init_db()
+    await browser_mgr.cleanup_stale()
+    browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
+    reaper_task = asyncio.create_task(_reap_zombies_periodically(), name="zombie-reaper")
+    logger.info("CloakBrowser Manager started")
+    yield
+    logger.info("Shutting down — stopping all browsers...")
+    reaper_task.cancel()
+    await asyncio.gather(reaper_task, return_exceptions=True)
+    if browser_mgr._auto_launch_task and not browser_mgr._auto_launch_task.done():
+        browser_mgr._auto_launch_task.cancel()
+        await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
+    await browser_mgr.cleanup_all()
+
+
 logger = logging.getLogger("cloakbrowser.manager")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logging.getLogger("websockets").setLevel(logging.WARNING)
@@ -45,18 +74,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
-# Optional authentication via AUTH_TOKEN env var.
-# If not set, all routes are open (local dev). If set, all /api/* routes
-# (except /api/auth/* and /api/status) require Bearer token or cookie.
 AUTH_TOKEN: str | None = os.environ.get("AUTH_TOKEN") or None
 
-# Paths that bypass authentication even when AUTH_TOKEN is set
 _AUTH_EXEMPT = frozenset({"/api/auth/status", "/api/auth/login", "/api/status"})
 
 
 def _check_auth(scope: Scope) -> bool:
-    """Check if the request has a valid auth token (header or cookie)."""
-    # Check Authorization: Bearer <token> header
     for key, val in scope.get("headers", []):
         if key == b"authorization":
             auth_value = val.decode()
@@ -66,7 +89,6 @@ def _check_auth(scope: Scope) -> bool:
                     return True
             break
 
-    # Check auth_token cookie
     for key, val in scope.get("headers", []):
         if key == b"cookie":
             cookies = SimpleCookie()
@@ -81,18 +103,11 @@ def _check_auth(scope: Scope) -> bool:
 
 
 def _is_https(request: Request) -> bool:
-    """Check if the original client connection was HTTPS (via reverse proxy header)."""
     proto = request.headers.get("x-forwarded-proto", "")
     return "https" in proto
 
 
 async def _check_websocket_origin(websocket: WebSocket) -> bool:
-    """Reject cross-origin WebSocket connections (CSWSH protection).
-
-    Browsers always send an Origin header on WebSocket upgrades.
-    Non-browser clients (Playwright, curl) typically don't — those are allowed.
-    If Origin is present, its host must match the request Host header.
-    """
     origin = None
     host = None
     for key, val in websocket.scope.get("headers", []):
@@ -101,11 +116,9 @@ async def _check_websocket_origin(websocket: WebSocket) -> bool:
         elif key == b"host":
             host = val.decode("latin-1")
 
-    # No Origin header → non-browser client (Playwright, Puppeteer) → allow
     if not origin:
         return True
 
-    # Parse origin to extract host:port
     try:
         parsed = urlparse(origin)
         origin_host = parsed.hostname or ""
@@ -114,16 +127,14 @@ async def _check_websocket_origin(websocket: WebSocket) -> bool:
         logger.warning("WebSocket origin malformed: %s", origin)
         await websocket.close(code=4403, reason="Origin not allowed")
         return False
-    # Build origin netloc (host:port or just host if default port)
     if origin_port and origin_port not in (80, 443):
         origin_netloc = f"{origin_host}:{origin_port}"
     else:
         origin_netloc = origin_host
 
     if not host:
-        return True  # no Host header to compare against
+        return True
 
-    # Strip default port from Host too (some proxies send "example.com:443")
     host_normalized = host
     if host.endswith(":80") or host.endswith(":443"):
         host_normalized = host.rsplit(":", 1)[0]
@@ -137,24 +148,16 @@ async def _check_websocket_origin(websocket: WebSocket) -> bool:
 
 
 class AuthMiddleware:
-    """Raw ASGI middleware for optional token auth.
-
-    Uses raw ASGI instead of BaseHTTPMiddleware because the latter
-    breaks WebSocket routes (wraps request body, preventing WS upgrade).
-    """
-
     def __init__(self, app: ASGIApp):
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        # Pass through if auth disabled, or non-HTTP/WS scope (e.g. lifespan)
         if not AUTH_TOKEN or scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
 
         path = scope["path"]
 
-        # Skip auth for exempt endpoints and non-API paths (static frontend)
         if path in _AUTH_EXEMPT or not path.startswith("/api/"):
             await self.app(scope, receive, send)
             return
@@ -163,9 +166,7 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Reject — unauthenticated
         if scope["type"] == "websocket":
-            # ASGI requires receiving websocket.connect before sending close
             await receive()
             await send({"type": "websocket.close", "code": 4401, "reason": "Unauthorized"})
         else:
@@ -173,27 +174,15 @@ class AuthMiddleware:
             await response(scope, receive, send)
 
 
-# Singleton browser manager
 browser_mgr = BrowserManager()
 
-# Frontend build directory (React production build)
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
 
-# ---------------------------------------------------------------------------
-# RFB server message translator — KasmVNC BinaryClipboard → standard RFB
-# ---------------------------------------------------------------------------
-
-
 def _parse_kasmvnc_clipboard(data: bytes) -> str | None:
-    """Extract text/plain from KasmVNC BinaryClipboard (type 180).
-
-    Format: type(1) + action(1) + flags(4) + entries...
-    Each entry: mime_len(u8) + mime(N) + data_len(u32 BE) + data(M)
-    """
     if len(data) < 7:
         return None
-    offset = 6  # skip type(1) + action(1) + flags(4)
+    offset = 6
     while offset < len(data):
         if offset + 1 > len(data):
             break
@@ -215,64 +204,41 @@ def _parse_kasmvnc_clipboard(data: bytes) -> str | None:
 
 
 def _build_server_cut_text(text: str) -> bytes:
-    """Build standard RFB ServerCutText (type 3) message.
-
-    RFB spec mandates Latin-1 encoding for ServerCutText.
-    Characters outside Latin-1 (CJK, emoji, etc.) are replaced with '?'.
-    """
     text_bytes = text.encode("latin-1", errors="replace")
     return struct.pack(">BxxxI", 3, len(text_bytes)) + text_bytes
 
 
-# ---------------------------------------------------------------------------
-# RFB client message filter — strip extension types KasmVNC doesn't support
-# ---------------------------------------------------------------------------
-# noVNC v1.4 batches multiple RFB messages into one WebSocket frame.
-# KasmVNC 1.3.3 crashes on unsupported types (150, 248, etc.).
-# We parse message boundaries using known sizes and keep only standard types.
-
-# Client→server message sizes (fixed, except 2 and 6 which encode length)
 _RFB_MSG_SIZE: dict[int, int | None] = {
-    0: 20,    # SetPixelFormat
-    2: None,  # SetEncodings — 4 + numEncodings*4 (rewritten to strip bad pseudo-encodings)
-    3: 10,    # FramebufferUpdateRequest
-    4: 8,     # KeyEvent
-    5: 6,     # PointerEvent
-    6: None,  # ClientCutText — 8 + length
+    0: 20,
+    2: None,
+    3: 10,
+    4: 8,
+    5: 6,
+    6: None,
 }
 
-# Extension types that noVNC sends — known sizes so we can skip past them
-# instead of breaking and dropping all trailing data in the frame.
 _RFB_EXTENSION_SIZE: dict[int, int] = {
-    150: 10,  # EnableContinuousUpdates (1+1+2+2+2+2)
-    248: 10,  # QEMU-like key event (observed from noVNC 1.4.0)
-    252: 4,   # xvp (1+1+1+1)
-    255: 4,   # QEMU audio control (1+1+2) — noVNC QEMUExtendedKeyEvent is actually 12
+    150: 10,
+    248: 10,
+    252: 4,
+    255: 4,
 }
 
-# Whitelist of encodings safe to send to KasmVNC.
-# Instead of trying to blocklist problematic pseudo-encodings (error-prone —
-# we had wrong numbers), we ONLY keep known-good encodings.
-# Anything not on this list is stripped from SetEncodings.
 _ALLOWED_ENCODINGS: set[int] = {
-    # Framebuffer encodings (standard RFB)
-    0,    # Raw
-    1,    # CopyRect
-    2,    # RRE
-    5,    # Hextile
-    7,    # Tight
-    16,   # ZRLE
-    # Safe pseudo-encodings
-    -239,  # Cursor (0xFFFFFF11) — cursor shape
-    -224,  # LastRect (0xFFFFFF20) — performance optimization
-    # Tight quality/compress levels (these are just hints)
-    *range(-32, -22),   # quality levels 0-9
-    *range(-256, -246),  # compress levels 0-9
+    0,
+    1,
+    2,
+    5,
+    7,
+    16,
+    -239,
+    -224,
+    *range(-32, -22),
+    *range(-256, -246),
 }
 
 
 def _rfb_msg_length(data: bytes, offset: int) -> int | None:
-    """Return total length of the RFB message at offset, or None if unrecognized."""
     if offset >= len(data):
         return None
     msg_type = data[offset]
@@ -280,27 +246,25 @@ def _rfb_msg_length(data: bytes, offset: int) -> int | None:
     if fixed is not None:
         return fixed
     remaining = len(data) - offset
-    if msg_type == 2 and remaining >= 4:  # SetEncodings
+    if msg_type == 2 and remaining >= 4:
         num_enc = struct.unpack_from(">H", data, offset + 2)[0]
         return 4 + num_enc * 4
-    if msg_type == 6 and remaining >= 8:  # ClientCutText
+    if msg_type == 6 and remaining >= 8:
         length = struct.unpack_from(">I", data, offset + 4)[0]
         return 8 + length
-    # Known extension types — skip past them instead of giving up
     ext_size = _RFB_EXTENSION_SIZE.get(msg_type)
     if ext_size is not None:
         return ext_size
-    return None  # truly unknown type
+    return None
 
 
 def _rewrite_set_encodings(data: bytes, offset: int, msg_len: int) -> bytes:
-    """Keep only whitelisted encodings in a SetEncodings message."""
     _log = logging.getLogger("cloakbrowser.manager")
     num_enc = struct.unpack_from(">H", data, offset + 2)[0]
     kept = []
     stripped = []
     for i in range(num_enc):
-        enc = struct.unpack_from(">i", data, offset + 4 + i * 4)[0]  # signed
+        enc = struct.unpack_from(">i", data, offset + 4 + i * 4)[0]
         if enc in _ALLOWED_ENCODINGS:
             kept.append(enc)
         else:
@@ -315,27 +279,13 @@ def _rewrite_set_encodings(data: bytes, offset: int, msg_len: int) -> bytes:
 
 
 def _rewrite_pointer_event(data: bytes, offset: int) -> bytes:
-    """Convert standard 6-byte PointerEvent to KasmVNC's 11-byte format.
-
-    Standard RFB:  [5:u8][mask:u8][x:u16][y:u16]          = 6 bytes
-    KasmVNC:       [5:u8][mask:u16][x:u16][y:u16][sx:s16][sy:s16] = 11 bytes
-    """
     mask = data[offset + 1]
     x = struct.unpack_from(">H", data, offset + 2)[0]
     y = struct.unpack_from(">H", data, offset + 4)[0]
-    # Expand mask from u8 to u16.  Scroll deltas (sx, sy) are zero because
-    # noVNC encodes scroll as button-mask bits (3=up, 4=down, 5=left, 6=right)
-    # which pass through in the mask.  KasmVNC accepts mask-bit scroll on its
-    # extended 11-byte format, so explicit deltas are unnecessary.
     return struct.pack(">BHHHhh", 5, mask, x, y, 0, 0)
 
 
 def _filter_rfb_client_messages(data: bytes) -> bytes:
-    """Parse concatenated RFB messages, keep only standard types (0-6).
-
-    Rewrites PointerEvents from 6-byte standard to 11-byte KasmVNC format
-    and strips unsupported pseudo-encodings from SetEncodings.
-    """
     _log = logging.getLogger("cloakbrowser.manager")
     result = bytearray()
     offset = 0
@@ -348,23 +298,19 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
                        msg_type, offset, len(data), len(data) - offset, data[offset:offset+20].hex())
             break
         if offset + msg_len > len(data):
-            # Incomplete message — DO NOT forward partial data, it desynchronizes
-            # the RFB stream (KasmVNC buffers partial reads across frames).
             _log.warning("RFB filter: DROPPING incomplete type=%d need=%d have=%d — would desync stream",
                          msg_type, msg_len, len(data) - offset)
             break
         msg_idx += 1
         if msg_type in _RFB_MSG_SIZE:
-            # Standard RFB type — keep (with rewrites for KasmVNC compatibility)
             _log.debug("RFB filter: KEEP type=%d len=%d at offset=%d (msg #%d in frame)", msg_type, msg_len, offset, msg_idx)
-            if msg_type == 2:  # SetEncodings — whitelist safe encodings
+            if msg_type == 2:
                 result.extend(_rewrite_set_encodings(data, offset, msg_len))
-            elif msg_type == 5:  # PointerEvent — expand to KasmVNC's 11-byte format
+            elif msg_type == 5:
                 result.extend(_rewrite_pointer_event(data, offset))
             else:
                 result.extend(data[offset:offset + msg_len])
         else:
-            # Extension type (150, 248, etc.) — skip but continue parsing
             _log.debug("RFB filter: SKIP extension type=%d len=%d at offset=%d (msg #%d in frame)", msg_type, msg_len, offset, msg_idx)
         offset += msg_len
     if len(result) != len(data):
@@ -372,33 +318,12 @@ def _filter_rfb_client_messages(data: bytes) -> bytes:
     return bytes(result)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    db.init_db()
-    await browser_mgr.cleanup_stale()
-    browser_mgr._auto_launch_task = asyncio.create_task(browser_mgr.auto_launch_all())
-    logger.info("CloakBrowser Manager started")
-    yield
-    logger.info("Shutting down — stopping all browsers...")
-    if browser_mgr._auto_launch_task and not browser_mgr._auto_launch_task.done():
-        browser_mgr._auto_launch_task.cancel()
-        await asyncio.gather(browser_mgr._auto_launch_task, return_exceptions=True)
-    await browser_mgr.cleanup_all()
-
-
 app = FastAPI(title="CloakBrowser Manager", lifespan=lifespan)
 app.add_middleware(AuthMiddleware)
 
 
-# ── Authentication ────────────────────────────────────────────────────────────
-
-
 @app.get("/api/auth/status")
 async def auth_status(request: starlette.requests.Request):
-    """Check if auth is enabled and if the current request is authenticated.
-
-    Exempt from auth middleware so the frontend can always call it.
-    """
     authenticated = False
     if AUTH_TOKEN:
         authenticated = _check_auth(request.scope)
@@ -430,9 +355,6 @@ async def auth_logout(request: Request, response: Response):
         key="auth_token", path="/", secure=is_https, samesite="strict",
     )
     return {"ok": True}
-
-
-# ── Profile CRUD ──────────────────────────────────────────────────────────────
 
 
 @app.get("/api/profiles", response_model=list[ProfileResponse])
@@ -481,7 +403,6 @@ async def get_profile(profile_id: str):
 
 @app.put("/api/profiles/{profile_id}", response_model=ProfileResponse)
 async def update_profile(profile_id: str, req: ProfileUpdate):
-    # Only pass fields that were explicitly set
     data = req.model_dump(exclude_unset=True)
     tags = data.pop("tags", None)
     if tags is not None:
@@ -499,7 +420,6 @@ async def update_profile(profile_id: str, req: ProfileUpdate):
 
 @app.delete("/api/profiles/{profile_id}")
 async def delete_profile(profile_id: str):
-    # Stop browser if running
     if profile_id in browser_mgr.running:
         await browser_mgr.stop(profile_id)
 
@@ -509,17 +429,12 @@ async def delete_profile(profile_id: str):
 
     user_data_dir = Path(profile["user_data_dir"])
 
-    # DB first — if this fails, filesystem is untouched
     db.delete_profile(profile_id)
 
-    # Then clean up disk
     if user_data_dir.exists():
         shutil.rmtree(user_data_dir, ignore_errors=True)
 
     return {"ok": True}
-
-
-# ── Launch / Stop ─────────────────────────────────────────────────────────────
 
 
 @app.post("/api/profiles/{profile_id}/launch", response_model=LaunchResponse)
@@ -564,9 +479,6 @@ async def get_profile_status(profile_id: str):
     return ProfileStatusResponse(**status)
 
 
-# ── System Status ─────────────────────────────────────────────────────────────
-
-
 @app.get("/api/status", response_model=StatusResponse)
 async def get_system_status():
     from cloakbrowser.config import CHROMIUM_VERSION
@@ -579,24 +491,19 @@ async def get_system_status():
     )
 
 
-# ── Clipboard Relay ──────────────────────────────────────────────────────────
+_CLIPBOARD_MAX_READ = 1_048_576
 
-_CLIPBOARD_MAX_READ = 1_048_576  # 1MB cap on GET response
-
-# Track xclip processes per display so we can kill the old one before spawning new
 _xclip_procs: dict[int, asyncio.subprocess.Process] = {}
 
 
 @app.post("/api/profiles/{profile_id}/clipboard")
 async def set_clipboard(profile_id: str, body: ClipboardRequest):
-    """Push text into the VNC session's X clipboard via xclip."""
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
 
     import os
 
-    # Kill previous xclip for this display (it stays alive to serve paste)
     old = _xclip_procs.pop(running.display, None)
     if old and old.returncode is None:
         old.kill()
@@ -608,10 +515,9 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
         stdin=asyncio.subprocess.PIPE,
         env=env,
     )
-    # xclip reads stdin then stays alive to serve paste requests.
-    proc.stdin.write(body.text.encode())  # type: ignore[union-attr]
-    await proc.stdin.drain()  # type: ignore[union-attr]
-    proc.stdin.close()  # type: ignore[union-attr]
+    proc.stdin.write(body.text.encode())
+    await proc.stdin.drain()
+    proc.stdin.close()
 
     _xclip_procs[running.display] = proc
 
@@ -620,21 +526,10 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
 
 @app.get("/api/profiles/{profile_id}/clipboard")
 async def get_clipboard(profile_id: str):
-    """Read the VNC session's clipboard.
-
-    Chrome doesn't write to X11 clipboard under KasmVNC, so xclip can't read it.
-    Instead, read via Playwright's CDP connection to Chrome (navigator.clipboard.readText).
-    Falls back to xclip for non-Chrome clipboard owners.
-    """
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
 
-    # Read Chrome's clipboard via Playwright/CDP when possible.
-    # If the page wrote to navigator.clipboard.writeText(), this sees the real
-    # browser clipboard even when there is no visible selection.
-    # The init script also captures copy events and patched writeText() calls.
-    # Check all pages — user may have copied in any tab
     try:
         for page in running.context.pages:
             try:
@@ -654,12 +549,10 @@ async def get_clipboard(profile_id: str):
                 if text:
                     return {"text": text[:_CLIPBOARD_MAX_READ]}
             except Exception as exc:
-                logger.debug("Clipboard read failed on page: %s", exc)
                 continue
     except Exception as exc:
-        logger.debug("Playwright clipboard read failed: %s", exc)
+        pass
 
-    # Fallback: xclip for non-Chrome clipboard owners
     import os
 
     env = {**os.environ, "DISPLAY": f":{running.display}"}
@@ -683,12 +576,8 @@ async def get_clipboard(profile_id: str):
     return {"text": text}
 
 
-# ── VNC WebSocket Proxy ──────────────────────────────────────────────────────
-
-
 @app.websocket("/api/profiles/{profile_id}/vnc")
 async def vnc_proxy(websocket: WebSocket, profile_id: str):
-    """Proxy WebSocket frames between the frontend and a profile's KasmVNC."""
     if not await _check_websocket_origin(websocket):
         return
 
@@ -697,8 +586,6 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
         await websocket.close(code=4004, reason="Profile not running")
         return
 
-    # Accept with client's requested subprotocol (if any) — RFC 6455 requires
-    # the server must not respond with a subprotocol the client didn't request.
     requested = websocket.scope.get("subprotocols", [])
     subprotocol = "binary" if "binary" in requested else None
     await websocket.accept(subprotocol=subprotocol)
@@ -712,74 +599,47 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
             vnc_url,
             subprotocols=["binary"],
             origin=f"http://127.0.0.1:{running.ws_port}",
-            max_size=None,  # VNC frames can be large (1920x1080 framebuffer)
-            ping_interval=None,  # KasmVNC doesn't respond to WS pings
+            max_size=None,
+            ping_interval=None,
             ping_timeout=None,
-            compression=None,  # KasmVNC can't handle permessage-deflate
+            compression=None,
         ) as vnc_ws:
-            logger.info(
-                "VNC proxy: connected to KasmVNC for %s (subprotocol=%s)",
-                profile_id, vnc_ws.subprotocol,
-            )
-
-            # noVNC v1.4 sends extension message types (150=ContinuousUpdates,
-            # 248=QEMUKey, etc.) that KasmVNC 1.3.3 doesn't support, causing
-            # "unknown message type" → disconnect.
-            #
-            # noVNC batches multiple RFB messages into a single WebSocket frame,
-            # so we must parse the RFB stream to find message boundaries and strip
-            # unsupported types before forwarding. Standard client→server types
-            # have known fixed sizes (except SetEncodings and ClientCutText which
-            # encode their length).
 
             async def client_to_vnc():
                 count = 0
-                handshake = 0  # first 3 messages are RFB handshake
+                handshake = 0
                 dropped = 0
                 try:
                     while True:
                         msg = await websocket.receive()
                         msg_type = msg.get("type", "")
                         if msg_type == "websocket.disconnect":
-                            logger.info("VNC proxy [c->v]: client disconnect (code=%s) after %d msgs (%d dropped)", msg.get("code"), count, dropped)
                             break
                         if "bytes" in msg and msg["bytes"]:
                             count += 1
                             data = msg["bytes"]
                             handshake += 1
 
-                            # First 3 messages are RFB handshake — forward as-is
                             if handshake <= 3:
-                                logger.debug("VNC handshake #%d: %d bytes hex=%s", handshake, len(data), data[:20].hex())
                                 await vnc_ws.send(data)
                                 continue
 
-                            # Parse RFB messages and strip unsupported types
                             filtered = _filter_rfb_client_messages(data)
                             if filtered:
-                                # Safety: verify first byte is a valid RFB client type
                                 if filtered[0] not in _RFB_MSG_SIZE:
-                                    logger.error("RFB SAFETY: refusing to send data with invalid first byte=%d hex=%s",
-                                                 filtered[0], filtered[:20].hex())
                                     dropped += 1
                                     continue
-                                logger.debug("VNC send: %d bytes first_type=%d hex=%s", len(filtered), filtered[0], filtered[:100].hex())
                                 await vnc_ws.send(filtered)
                             else:
                                 dropped += 1
 
                         elif "text" in msg and msg["text"]:
-                            # noVNC only sends binary frames — text frames are unexpected
-                            # and would bypass the RFB filter, so drop them.
                             count += 1
-                            logger.warning("VNC proxy [c->v]: DROPPING text frame len=%d (noVNC should only send binary)", len(msg["text"]))
                             dropped += 1
-                        else:
-                            logger.warning("VNC proxy [c->v]: unhandled msg keys=%s type=%s", list(msg.keys()), msg_type)
-                except WebSocketDisconnect as exc:
-                    logger.info("VNC proxy [c->v]: WebSocketDisconnect code=%s after %d msgs (%d dropped)", exc.code, count, dropped)
-                except Exception as exc:
-                    logger.warning("VNC proxy [c->v]: %s: %s (after %d msgs)", type(exc).__name__, exc, count)
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
 
             async def vnc_to_client():
                 count = 0
@@ -789,25 +649,19 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                         if isinstance(msg, bytes) and len(msg) > 0:
                             msg_type = msg[0]
                             if msg_type == 180:
-                                # KasmVNC BinaryClipboard → convert to standard
-                                # ServerCutText (type 3) so noVNC can handle it
                                 text = _parse_kasmvnc_clipboard(msg)
                                 if text:
-                                    logger.info("VNC proxy [v->c]: clipboard %d chars", len(text))
                                     await websocket.send_bytes(_build_server_cut_text(text))
-                                else:
-                                    logger.info("VNC proxy [v->c]: dropped type 180 (no text/plain)")
                                 continue
                             await websocket.send_bytes(msg)
                         elif isinstance(msg, bytes):
                             await websocket.send_bytes(msg)
                         else:
                             await websocket.send_text(msg)
-                    logger.info("VNC proxy [v->c]: KasmVNC stream ended after %d msgs (close_code=%s)", count, vnc_ws.close_code)
-                except WebSocketDisconnect as exc:
-                    logger.info("VNC proxy [v->c]: client disconnect code=%s after %d msgs", exc.code, count)
-                except Exception as exc:
-                    logger.warning("VNC proxy [v->c]: %s: %s (after %d msgs)", type(exc).__name__, exc, count)
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
 
             c2v = asyncio.create_task(client_to_vnc(), name="c2v")
             v2c = asyncio.create_task(vnc_to_client(), name="v2c")
@@ -816,47 +670,21 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
                 [c2v, v2c],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            finished = [t.get_name() for t in done]
-            still_running = [t.get_name() for t in pending]
-
-            # Check if Xvnc is still alive
-            vnc_instance = browser_mgr.vnc._allocated.get(running.display)
-            xvnc_alive = vnc_instance and vnc_instance.process and vnc_instance.process.poll() is None
-            logger.info(
-                "VNC proxy: finished=%s pending=%s xvnc_alive=%s display=:%d for %s",
-                finished, still_running, xvnc_alive, running.display, profile_id,
-            )
-
-            # Dump Xvnc log on disconnect
-            import os
-            xvnc_log = f"/tmp/xvnc-{running.display}.log"
-            if os.path.exists(xvnc_log):
-                with open(xvnc_log) as f:
-                    log_content = f.read()
-                if log_content.strip():
-                    for line in log_content.strip().split("\n")[-20:]:
-                        logger.info("Xvnc[:%d] %s", running.display, line)
 
             for task in pending:
                 task.cancel()
 
     except Exception as exc:
-        logger.error("VNC proxy connect error for %s: %s: %s", profile_id, type(exc).__name__, exc)
+        pass
     finally:
         try:
             await websocket.close()
-        except Exception as exc:
-            logger.debug("VNC proxy: websocket.close() failed: %s", exc)
-
-
-# ── CDP WebSocket Proxy ──────────────────────────────────────────────────────
-# Simple bidirectional passthrough — CDP is standard JSON over WebSocket,
-# no protocol translation needed (unlike VNC which requires RFB filtering).
+        except Exception:
+            pass
 
 
 @app.get("/api/profiles/{profile_id}/cdp")
 async def cdp_info(profile_id: str):
-    """Return CDP connection info. Prevents SPA catch-all from serving index.html."""
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
@@ -870,7 +698,6 @@ async def cdp_info(profile_id: str):
 @app.get("/api/profiles/{profile_id}/cdp/json/version/")
 @app.get("/api/profiles/{profile_id}/cdp/json/version")
 async def cdp_json_version(profile_id: str, request: Request):
-    """Proxy Chrome's /json/version, rewriting WS URLs to go through our proxy."""
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
@@ -882,10 +709,8 @@ async def cdp_json_version(profile_id: str, request: Request):
             )
             data = resp.json()
     except Exception as exc:
-        logger.error("CDP proxy: failed to reach Chrome CDP for %s: %s", profile_id, exc)
         raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
 
-    # Rewrite webSocketDebuggerUrl to point through our proxy
     host = request.headers.get("host", "localhost:8080")
     ws_scheme = "wss" if _is_https(request) else "ws"
     data["webSocketDebuggerUrl"] = f"{ws_scheme}://{host}/api/profiles/{profile_id}/cdp"
@@ -897,7 +722,6 @@ async def cdp_json_version(profile_id: str, request: Request):
 @app.get("/api/profiles/{profile_id}/cdp/json/")
 @app.get("/api/profiles/{profile_id}/cdp/json")
 async def cdp_json_list(profile_id: str, request: Request):
-    """Proxy Chrome's /json/list, rewriting WS URLs."""
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
@@ -909,7 +733,6 @@ async def cdp_json_list(profile_id: str, request: Request):
             )
             data = resp.json()
     except Exception as exc:
-        logger.error("CDP proxy: failed to reach Chrome CDP for %s: %s", profile_id, exc)
         raise HTTPException(status_code=502, detail="CDP endpoint unreachable")
 
     host = request.headers.get("host", "localhost:8080")
@@ -926,17 +749,12 @@ async def cdp_json_list(profile_id: str, request: Request):
 async def _proxy_cdp_websocket(
     websocket: WebSocket, target_url: str, label: str,
 ) -> None:
-    """Bidirectional WebSocket proxy between a FastAPI client and a CDP target.
-
-    Used by both browser-level and page-level CDP proxy endpoints.
-    """
     import websockets
 
     try:
         async with websockets.connect(
             target_url, max_size=None, ping_interval=None, ping_timeout=None
         ) as cdp_ws:
-            logger.info("%s: connected to %s", label, target_url)
 
             async def client_to_cdp():
                 try:
@@ -950,8 +768,8 @@ async def _proxy_cdp_websocket(
                             await cdp_ws.send(msg["bytes"])
                 except WebSocketDisconnect:
                     pass
-                except Exception as exc:
-                    logger.warning("%s [c->cdp]: %s: %s", label, type(exc).__name__, exc)
+                except Exception:
+                    pass
 
             async def cdp_to_client():
                 try:
@@ -962,8 +780,8 @@ async def _proxy_cdp_websocket(
                             await websocket.send_bytes(msg)
                 except WebSocketDisconnect:
                     pass
-                except Exception as exc:
-                    logger.warning("%s [cdp->c]: %s: %s", label, type(exc).__name__, exc)
+                except Exception:
+                    pass
 
             c2d = asyncio.create_task(client_to_cdp(), name="c2d")
             d2c = asyncio.create_task(cdp_to_client(), name="d2c")
@@ -972,20 +790,18 @@ async def _proxy_cdp_websocket(
             )
             for task in pending:
                 task.cancel()
-            logger.info("%s: disconnected", label)
 
-    except Exception as exc:
-        logger.error("%s error: %s", label, exc)
+    except Exception:
+        pass
     finally:
         try:
             await websocket.close()
-        except Exception as exc:
-            logger.debug("%s: websocket.close() failed: %s", label, exc)
+        except Exception:
+            pass
 
 
 @app.websocket("/api/profiles/{profile_id}/cdp")
 async def cdp_proxy(websocket: WebSocket, profile_id: str):
-    """Proxy WebSocket frames between external tools and Chrome's CDP."""
     if not await _check_websocket_origin(websocket):
         return
 
@@ -996,7 +812,6 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
 
     await websocket.accept()
 
-    # Get browser-level CDP WebSocket URL from Chrome
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -1004,7 +819,6 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
             )
             ws_url = resp.json()["webSocketDebuggerUrl"]
     except Exception as exc:
-        logger.error("CDP proxy: failed to get WS URL for %s: %s", profile_id, exc)
         await websocket.close(code=4005, reason="CDP not available")
         return
 
@@ -1013,7 +827,6 @@ async def cdp_proxy(websocket: WebSocket, profile_id: str):
 
 @app.websocket("/api/profiles/{profile_id}/cdp/devtools/{path:path}")
 async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
-    """Proxy page-specific CDP WebSocket connections (e.g. /devtools/page/GUID)."""
     if not await _check_websocket_origin(websocket):
         return
 
@@ -1028,15 +841,11 @@ async def cdp_page_proxy(websocket: WebSocket, profile_id: str, path: str):
     await _proxy_cdp_websocket(websocket, target_url, f"CDP page proxy [{profile_id}]")
 
 
-# ── Static Frontend ───────────────────────────────────────────────────────────
-
-# Serve React build. Must be AFTER API routes so /api/* isn't caught by the SPA.
 if FRONTEND_DIR.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
-        """Serve React SPA — all non-API routes return index.html."""
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not found")
         file_path = FRONTEND_DIR / full_path
